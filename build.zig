@@ -11,16 +11,16 @@ pub fn build(b: *std.build.Builder) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const mode = b.standardReleaseOptions();
 
-    const lib = b.addStaticLibrary("colosseum", "src/main.zig");
+    const lib = b.addStaticLibrary("colosseum", "src/colosseum.zig");
     lib.setBuildMode(mode);
     lib.install();
 
-    const exe_tests = b.addTestExe("debug_test", "src/main.zig");
+    const exe_tests = b.addTestExe("debug_test", "src/colosseum.zig");
     exe_tests.setTarget(target);
     exe_tests.setBuildMode(mode);
     exe_tests.install();
 
-    const main_tests = b.addTest("src/main.zig");
+    const main_tests = b.addTest("src/colosseum.zig");
     main_tests.setBuildMode(mode);
 
     const test_step = b.step("test", "Run library tests");
