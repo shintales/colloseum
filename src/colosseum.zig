@@ -2,74 +2,125 @@ const std = @import("std");
 const testing = std.testing;
 
 /// The `Arena` allows appending and removing elements that are referred to by
-/// `Index`.
+/// `Arena(T).Index`.
 const DEFAULT_CAPACITY: usize = 4;
 
 pub const Error = error{ MutateOnEmptyEntry };
 
-const EntryStatus = union(enum) {
-    occupied: Index,
-    empty: EmptyEntry,
-
-    fn Occupied(i: Index) EntryStatus {
-        return .{ .occupied = i };
-    }
-
-    fn Empty(next_free: ?usize, generation: usize) EntryStatus {
-        return .{ .empty = EmptyEntry{ .next_free = next_free, .generation = generation } };
-    }
-};
-
-pub const Index = struct {
-    index: usize,
-    generation: usize,
-
-    pub fn fromParts(index: usize, generation: usize) Index {
-        return .{ .index = index, .generation = generation };
-    }
-
-    pub fn equals(a: Index, b: Index) bool {
-        return a.index == b.index and a.generation == b.generation;
-    }
-};
-
-const EmptyEntry = struct {
-    next_free: ?usize,
-    generation: usize,
-};
-
-pub fn Arena(comptime Entry: type) type {
+pub fn Arena(comptime T: type) type {
     return struct {
         const Self = @This();
-        const EntryList = std.MultiArrayList(Entry);
-        const StatusList = std.ArrayListUnmanaged(EntryStatus);
 
         allocator: std.mem.Allocator,
-        entries: EntryList,
-        statuses: StatusList,
-        free_list_head: ?usize,
-        len: usize,
+        unmanaged: Unmanaged,
+
+        const Unmanaged = ArenaUnmanaged(T);
+
+        pub const Index = Unmanaged.Index;
+        pub const Entry = Unmanaged.Entry;
 
         pub fn init(allocator: std.mem.Allocator) Self {
-            return withCapacity(allocator, DEFAULT_CAPACITY);
+            return .{
+                .allocator = allocator,
+                .unmanaged = Unmanaged{},
+            };
         }
 
         pub fn deinit(self: *Self) void {
-            self.entries.deinit(self.allocator);
-            self.statuses.deinit(self.allocator);
+            self.unmanaged.deinit(self.allocator);
         }
 
-        /// Create an arena with an initial capacity
-        fn withCapacity(allocator: std.mem.Allocator, _capacity: usize) Self {
-            var arena = Self{
-                .allocator = allocator,
-                .entries = EntryList{},
-                .statuses = StatusList{},
-                .free_list_head = null,
-                .len = 0,
-            };
-            arena.reserve(_capacity) catch unreachable;
-            return arena;
+        pub fn capacity(self: *const Self) usize {
+            return self.unmanaged.capacity();
+        }
+
+        pub fn append(self: *Self, item: T) !Index {
+            return self.unmanaged.append(self.allocator, item);
+        }
+
+        pub fn clear(self: *Self) void {
+            self.unmanaged.clear(self.allocator);
+        }
+
+        pub fn remove(self: *Self, i: Index) ?Entry {
+            return self.unmanaged.remove(i);
+        }
+
+        /// Check if an index exists in the arena 
+        pub fn contains(self: *Self, i: Index) bool {
+            return self.unmanaged.contains(i);
+        }
+
+        pub fn get(self: *Self, i: Index) ?Entry {
+            return self.unmanaged.get(i);
+        }
+
+        /// Overwrite one arena element with new data.
+        pub fn mutate(self: *Self, i: Index, entry: Entry) !void {
+            self.unmanaged.mutate(i,entry) catch |err| return err;
+        }
+
+        /// Check if the arena is empty
+        pub fn isEmpty(self: *Self) bool {
+            return self.unmanaged.isEmpty();
+        }
+
+        pub const Iterator = Unmanaged.Iterator;
+
+        pub fn iterator(self: *Self) Iterator {
+            return self.unmanaged.iterator();
+        }
+    };
+}
+
+pub fn ArenaUnmanaged(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        pub const Index = struct {
+            index: usize,
+            generation: usize,
+
+            pub fn fromParts(index: usize, generation: usize) Index {
+                return .{ .index = index, .generation = generation };
+            }
+
+            pub fn equals(a: Index, b: Index) bool {
+                return a.index == b.index and a.generation == b.generation;
+            }
+        };
+
+        const EmptyEntry = struct {
+            next_free: ?usize,
+            generation: usize,
+        };
+
+        const EntryStatus = union(enum) {
+            occupied: Index,
+            empty: EmptyEntry,
+
+            fn Occupied(i: Index) EntryStatus {
+                return .{ .occupied = i };
+            }
+
+            fn Empty(next_free: ?usize, generation: usize) EntryStatus {
+                return .{ .empty = EmptyEntry{ .next_free = next_free, .generation = generation } };
+            }
+        };
+
+
+        pub const Entry = T;
+        const EntryList = std.MultiArrayList(Entry);
+        const StatusList = std.ArrayListUnmanaged(EntryStatus);
+
+        entries: EntryList = .{},
+        statuses: StatusList = .{},
+        free_list_head: ?usize = null,
+        len: usize = 0,
+
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            self.entries.deinit(allocator);
+            self.statuses.deinit(allocator);
         }
 
         /// Get the current capacity of the arena
@@ -78,7 +129,7 @@ pub fn Arena(comptime Entry: type) type {
         }
 
         /// Allocate space for a new entry
-        fn alloc(self: *Self) ?Index {
+        fn alloc(self: *Self, allocator: std.mem.Allocator) !Index {
             if (self.free_list_head) |i| {
                 switch (self.statuses.items[i]) {
                     .occupied => {
@@ -91,41 +142,28 @@ pub fn Arena(comptime Entry: type) type {
                     },
                 }
             } else {
-                return null;
+                var i = self.statuses.items.len;
+                try self.statuses.append(allocator, EntryStatus.Empty(i, 0));
+                try self.entries.resize(allocator, self.statuses.capacity);
+                self.len += 1;
+                return Index.fromParts(i, 0);
             }
         }
 
         /// Extend the list by 1 element. Allocates more memory as necessary.
-        pub fn append(self: *Self, item: Entry) !Index {
-            return if (self.appendQuick(item)) |index| {
-                    return index;
-                } else {
-                    return self.appendSlow(item) catch |err| return err;
-                };
-        }
-
-        fn appendQuick(self: *Self, value: Entry) ?Index {
-            if (self.alloc()) |index| {
-                self.entries.set(index.index, value);
-                self.statuses.items[index.index] = EntryStatus.Occupied(index);
-                return index;
-            } else return null;
-        }
-
-        fn appendSlow(self: *Self, value: Entry) !Index {
-            var len = self.entries.len;
-            try self.reserve(len);
-            // Since the reserve would have succeeded, appendQuick would not have to
-            // output a null value
-            return self.appendQuick(value).?;
+        pub fn append(self: *Self, allocator: std.mem.Allocator, item: T) !Index {
+            var index = try self.alloc(allocator);
+            self.entries.set(index.index, item);
+            self.statuses.items[index.index] = EntryStatus.Occupied(index);
+            return index;
         }
 
         /// Mark all entries as empty and invalidate their data
-        pub fn clear(self: *Self) void {
+        pub fn clear(self: *Self, allocator: std.mem.Allocator) void {
             self.entries.shrinkRetainingCapacity(0);
             self.statuses.clearRetainingCapacity();
             self.statuses.expandToCapacity();
-            self.entries.setCapacity(self.allocator, self.statuses.capacity) catch unreachable;
+            self.entries.setCapacity(allocator, self.statuses.capacity) catch unreachable;
 
             var end = self.statuses.capacity;
             for (self.statuses.items) |*status, i| {
@@ -193,105 +231,108 @@ pub fn Arena(comptime Entry: type) type {
             return self.len == 0;
         }
 
-        /// Allocate space for `additional_capacity` more elements in the arena.
-        pub fn reserve(self: *Self, additional_capacity: usize) !void {
-            var start = self.statuses.items.len;
-            var end = start + additional_capacity;
-            var old_list_head = self.free_list_head;
-            try self.entries.resize(self.allocator, end);
-            try self.statuses.resize(self.allocator, end);
+        pub const Iterator = struct {
+            ctx: *Self,
+            pos: usize = 0,
 
-            for (self.statuses.items[start..end]) |*status, unpadded_i| {
-                const i = unpadded_i + start;
-                if (i == (end - 1)) {
-                    status.* = EntryStatus.Empty(old_list_head, 0);
-                } else {               
-                    status.* = EntryStatus.Empty(i + 1, 0);
-                }
+            pub fn next(self: *Iterator) ?Index {
+                if ((self.pos) >= self.ctx.len) return null;
+                return switch(self.ctx.statuses.items[self.pos]) {
+                    .empty => {
+                        self.pos += 1;
+                        return self.next();
+                    },
+                    .occupied => |occupant| {
+                        self.pos += 1;
+                        return occupant;
+                    } 
+                };
             }
-            
-            self.free_list_head = start;  
+        };
+
+        pub fn iterator(self: *Self) Iterator {
+            return Self.Iterator{ .ctx = self };
         }
     };
 }
 
-const RigidBody = struct {
-    position: usize,
-    velocity: usize,
+const Example = struct {
+    a: usize,
+    b: usize,
 
-    fn default() RigidBody {
+    fn default() Example {
         return .{
-            .position = 0,
-            .velocity = 0,
+            .a = 0,
+            .b = 0,
         };
     }
 };
 
+const ExampleArena = Arena(Example);
+const ExampleArenaUnmanaged = ArenaUnmanaged(Example);
+const ExampleArenaIndex = ExampleArena.Index;
+
 test "Arena.alloc" {
     var allocator = std.testing.allocator;
-    var arena = Arena(RigidBody).init(allocator);
-    defer arena.deinit();
-
-    var i = arena.alloc().?;
+    var arena = ExampleArenaUnmanaged{};
+    defer arena.deinit(allocator);
+    
+    var i = try arena.alloc(allocator);
     try std.testing.expectEqual(i.index, 0);
     try std.testing.expectEqual(i.generation, 0);
 }
 
 test "Arena.append" {
     var allocator = std.testing.allocator;
-    var arena = Arena(RigidBody).init(allocator);
+    var arena = ExampleArena.init(allocator);
     defer arena.deinit();
 
-    var rb = RigidBody.default();
+    var rb = Example.default();
     var i: usize = 0;
     while (i < 10000) : (i += 1) {
         var index = try arena.append(rb);
-        try std.testing.expectEqual(index, Index.fromParts(i, 0));
+        try std.testing.expectEqual(index, ExampleArenaIndex.fromParts(i, 0));
         try std.testing.expectEqual(arena.get(index).?, rb);
     }
 }
 
 test "Arena.remove" {
     var allocator = std.testing.allocator;
-    var arena = Arena(RigidBody).init(allocator);
+    var arena = ExampleArena.init(allocator);
     defer arena.deinit();
 
-    var rb = RigidBody.default();
+    var rb = Example.default();
     var i: usize = 0;
-    try std.testing.expectEqual(@as(usize,4), arena.capacity());
     
     while (i < 4) : (i += 1) {
         var index = try arena.append(rb);
         try std.testing.expectEqual(arena.get(index).?, rb);
-        try std.testing.expectEqual(index, Index.fromParts(i, 0));
+        try std.testing.expectEqual(index, ExampleArenaIndex.fromParts(i, 0));
     }
-    try std.testing.expectEqual(@as(usize,4), arena.capacity());
     
     while (i < 4) : (i += 1) {
-        const index = Index.fromParts(i, 0);
+        const index = ExampleArenaIndex.fromParts(i, 0);
         var before_delete = arena.get(index).?;
         var deleted_entry = arena.remove(index).?;
         try std.testing.expect(!arena.contains(index));
         try std.testing.expectEqual(before_delete, deleted_entry);
     }
-    try std.testing.expectEqual(@as(usize,4), arena.capacity());
     
     while (i < 4) : (i += 1) {
         var index = try arena.append(rb);
         try std.testing.expectEqual(arena.get(index).?, rb);
-        try std.testing.expectEqual(index, Index.fromParts(i, 1));
+        try std.testing.expectEqual(index, ExampleArenaIndex.fromParts(i, 1));
     }
-    try std.testing.expectEqual(@as(usize,4), arena.capacity());
 }
 
 test "Arena.clear" {
     var allocator = std.testing.allocator;
-    var arena = Arena(RigidBody).init(allocator);
+    var arena = ExampleArena.init(allocator);
     defer arena.deinit();
 
-    var index1 = try arena.append(RigidBody.default());
-    var index2 = try arena.append(RigidBody.default());
-    var index3 = try arena.append(RigidBody.default());
+    var index1 = try arena.append(Example.default());
+    var index2 = try arena.append(Example.default());
+    var index3 = try arena.append(Example.default());
     arena.clear();
     try std.testing.expect(!arena.contains(index1));
     try std.testing.expect(!arena.contains(index2));
@@ -300,13 +341,34 @@ test "Arena.clear" {
 
 test "Arena.mutate" {
     var allocator = std.testing.allocator;
-    var arena = Arena(RigidBody).init(allocator);
+    var arena = ExampleArena.init(allocator);
     defer arena.deinit();
 
-    var index = try arena.append(RigidBody.default());
+    var index = try arena.append(Example.default());
     var rb = arena.get(index).?;
-    rb.position = 1;
-    rb.velocity = 1;
+    rb.a = 1;
+    rb.b = 1;
     try arena.mutate(index, rb);
     try std.testing.expectEqual(arena.get(index).?, rb);
+}
+
+test "Arena.iterator" {
+    var allocator = std.testing.allocator;
+    var arena = ExampleArena.init(allocator);
+    defer arena.deinit();
+
+    var rb = Example.default();
+    _ = try arena.append(rb);
+    var delete_index = try arena.append(rb);
+    _ = arena.remove(delete_index);
+    delete_index = try arena.append(rb);
+    _ = arena.remove(delete_index);
+    _ = try arena.append(rb);
+
+    var iter = arena.iterator();
+    var counter: usize = 0;
+    while (iter.next()) |_| {
+        counter += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), counter);
 }
