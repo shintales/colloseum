@@ -1,12 +1,10 @@
 const std = @import("std");
 const testing = std.testing;
 
-/// The `Arena` allows appending and removing elements that are referred to by
-/// `Arena(T).Index`.
-const DEFAULT_CAPACITY: usize = 4;
-
 pub const Error = error{ MutateOnEmptyEntry };
 
+/// The `Arena` allows appending and removing elements that are referred to by
+/// `Arena(T).Index`.
 pub fn Arena(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -367,8 +365,9 @@ test "Arena.iterator" {
 
     var iter = arena.iterator();
     var counter: usize = 0;
-    while (iter.next()) |_| {
+    while (iter.next()) |i| {
         counter += 1;
+        try std.testing.expectEqual(arena.get(i).?, rb);
     }
     try std.testing.expectEqual(@as(usize, 2), counter);
 }
